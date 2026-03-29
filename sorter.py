@@ -47,7 +47,7 @@ MAX_ANCHOR_CHARS = 2000
 # ── Model ─────────────────────────────────────────────────────
 # all-MiniLM-L6-v2  → ~80 MB one-time download, fast (~0.3 s/file)
 # all-mpnet-base-v2 → ~420 MB, higher accuracy, slower
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "all-mpnet-base-v2"
 
 # ── Report filenames ──────────────────────────────────────────
 REPORT_TXT = "sorting_report.txt"
