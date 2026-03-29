@@ -1,89 +1,92 @@
 #!/usr/bin/env python3
 """
-════════════════════════════════════════════════════════════════
-  ClassSort AI v2 — Semantic File Organizer + Bulk Review GUI
-  macOS | Python 3.8+ | tkinter (built-in) + sentence-transformers
-════════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════════
+  ClassSort AI v5 — Ollama + PyQt6 | Clean UI · Fast · Context-Aware
+  macOS | Python 3.9+ | PyQt6 + Ollama (local LLM)
+════════════════════════════════════════════════════════════════════
 
-FLOW:
-  Phase 1 — Background AI scan (progress shown on a loading screen)
-  Phase 2 — Tkinter Bulk Review GUI  (treeview, editable destinations)
-  Phase 3 — Execute Moves button     (moves/simulates + always writes reports)
+WHAT'S NEW IN v5
+  ┌─ UI ──────────────────────────────────────────────────────────┐
+  │  • Removed fake nav list, user profile row, dummy tab bar,    │
+  │    filter/column buttons, and the Sparkline widget entirely.  │
+  │  • Table is now 5 clean columns: # · File · Score · Dest · Type │
+  └───────────────────────────────────────────────────────────────┘
+  ┌─ AI ──────────────────────────────────────────────────────────┐
+  │  • Folder profiling: up to 10 existing filenames per class    │
+  │    folder are injected into the system prompt so the LLM can  │
+  │    pattern-match incoming files against what's already there. │
+  └───────────────────────────────────────────────────────────────┘
+  ┌─ SPEED ────────────────────────────────────────────────────────┐
+  │  • ThreadPoolExecutor pre-extracts text in parallel before    │
+  │    the Ollama batching loop starts.                           │
+  │  • MAX_EXTRACT_CHARS = 1500  (was 6000).                      │
+  │  • Fast-fail: media/archive extensions skip extraction.       │
+  │  • Top-level subfolders in source → instant Unsorted (0 %).   │
+  │  • BATCH_SIZE = 10 Ollama calls per round-trip.               │
+  └───────────────────────────────────────────────────────────────┘
 
-KEY CHANGES FROM v1:
-  • No dynamic Unsorted subdirectories — unmatched files go directly to
-    a single flat  All Classes/Unsorted/  folder.
-  • Bulk Review GUI replaces CLI interaction.  Every file is shown in a
-    treeview table; click any Destination cell to reassign it.
-  • Reports (TXT + CSV) are ALWAYS written to disk — even in DRY_RUN mode.
-  • A scrollable Results window opens automatically after execution.
-
-REQUIRED PACKAGES:
-    pip install sentence-transformers keybert PyPDF2 python-docx python-pptx openpyxl
+SETUP
+  pip install PyQt6 PyPDF2 python-docx python-pptx openpyxl requests
+  brew install ollama && ollama pull llama3.2
+  ollama serve          ← keep running in a separate terminal tab
 """
 
-# ════════════════════════════════════════════════════════════════
-#  SECTION 1 — CONFIGURATION  (edit freely)
-# ════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+#  §1  CONFIGURATION  — edit this block freely
+# ════════════════════════════════════════════════════════════════════
 
 SOURCE_FOLDER  = "/Users/justinevaldes/Desktop/toSort"
 CLASSES_FOLDER = "/Users/justinevaldes/Desktop/school"
 
-# Set True  → simulate without moving files.
-# Reports are ALWAYS written to disk regardless of this flag.
+# True  = nothing moves; reports still written.  False = live.
 DRY_RUN = True
 
-# ── Similarity thresholds (cosine similarity: 0.0–1.0) ───────
-MIN_SIMILARITY   = 0.28   # below this → Unsorted
-STRONG_THRESHOLD = 0.45   # at or above → confident match
-AMBIGUITY_GAP    = 0.06   # top-2 classes within this gap → ambiguous
+# ── Ollama ────────────────────────────────────────────────────────
+OLLAMA_URL     = "http://localhost:11434/api/generate"
+OLLAMA_MODEL   = "llama3.2"       # swap to phi3, mistral, etc.
+OLLAMA_TIMEOUT = 90               # seconds per batch request
 
-# ── Anchor enrichment ────────────────────────────────────────
-# Sample existing files inside each class folder to enrich its
-# semantic representation.  Set MAX_ANCHOR_FILES = 0 to disable.
-MAX_ANCHOR_FILES = 5
-MAX_ANCHOR_CHARS = 2000
+# ── Confidence tiers ──────────────────────────────────────────────
+HIGH_CONFIDENCE   = 75   # ≥ this → green / auto-move
+MEDIUM_CONFIDENCE = 40   # ≥ this → yellow / review; < 40 → red / Unsorted
 
-# ── Model ─────────────────────────────────────────────────────
-# all-MiniLM-L6-v2  → ~80 MB one-time download, fast (~0.3 s/file)
-# all-mpnet-base-v2 → ~420 MB, higher accuracy, slower
-EMBEDDING_MODEL = "all-mpnet-base-v2"
+# ── Speed settings ────────────────────────────────────────────────
+MAX_EXTRACT_CHARS   = 1500   # keep prompts short for local LLMs
+BATCH_SIZE          = 10     # files per Ollama call
+EXTRACTION_WORKERS  = 6      # ThreadPoolExecutor thread count
 
-# ── Report filenames ──────────────────────────────────────────
-REPORT_TXT = "sorting_report.txt"
+# ── Folder profiling (context-aware AI) ───────────────────────────
+MAX_PROFILE_FILES   = 10     # existing filenames to sample per class folder
+
+# ── Report ────────────────────────────────────────────────────────
 REPORT_CSV = "sorting_report.csv"
 
-# ── File type sets ────────────────────────────────────────────
-IMAGE_EXTENSIONS   = {".jpg", ".jpeg", ".png", ".gif", ".bmp",
-                      ".tiff", ".heic", ".webp", ".svg"}
-ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".rar", ".7z", ".dmg", ".pkg"}
 
+# ════════════════════════════════════════════════════════════════════
+#  §2  IMPORTS
+# ════════════════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════════════════════════════
-#  SECTION 2 — IMPORTS
-# ════════════════════════════════════════════════════════════════
-
-import os, re, sys, csv, shutil, queue, logging, threading, traceback
+import os, re, sys, csv, json, shutil, logging, traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+import requests
 
-# ── Optional AI / extraction libraries ───────────────────────
-try:
-    from sentence_transformers import SentenceTransformer, util as st_util
-    HAS_SBERT = True
-except ImportError:
-    HAS_SBERT = False
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QTableWidget, QTableWidgetItem, QComboBox,
+    QProgressBar, QHeaderView, QFrame, QSizePolicy,
+    QMessageBox, QAbstractItemView, QAbstractScrollArea,
+    QGraphicsDropShadowEffect,
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF
+from PyQt6.QtGui  import (
+    QColor, QPainter, QPainterPath, QBrush, QPen, QLinearGradient, QFont,
+)
 
-try:
-    from keybert import KeyBERT          # noqa: F401 (imported for future use)
-    HAS_KEYBERT = True
-except ImportError:
-    HAS_KEYBERT = False
-
+# ── Optional extraction libraries ─────────────────────────────────
 try:
     import PyPDF2;                        HAS_PYPDF2   = True
 except ImportError:                       HAS_PYPDF2   = False
@@ -91,19 +94,38 @@ try:
     from docx import Document as DocxDoc; HAS_DOCX     = True
 except ImportError:                       HAS_DOCX     = False
 try:
-    from pptx import Presentation as PptxPrs; HAS_PPTX = True
+    from pptx import Presentation as Prs; HAS_PPTX     = True
 except ImportError:                       HAS_PPTX     = False
 try:
     import openpyxl;                      HAS_OPENPYXL = True
 except ImportError:                       HAS_OPENPYXL = False
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
-log = logging.getLogger("ClassSort-AI")
+log = logging.getLogger("ClassSort-v5")
 
 
-# ════════════════════════════════════════════════════════════════
-#  SECTION 3 — TEXT EXTRACTION
-# ════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+#  §3  TEXT EXTRACTION
+#      Fast-fail for media/archives; parallel dispatch via executor.
+# ════════════════════════════════════════════════════════════════════
+
+# Extensions that have no readable text — skip immediately
+SKIP_EXTENSIONS = {
+    # Images
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
+    ".heic", ".heif", ".webp", ".svg", ".ico", ".raw", ".cr2", ".nef",
+    # Video
+    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".m4v", ".webm",
+    # Audio
+    ".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma", ".aiff",
+    # Archives & disk images
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar", ".7z",
+    ".dmg", ".pkg", ".iso", ".img",
+    # Compiled / binary
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".class",
+    # Fonts
+    ".ttf", ".otf", ".woff", ".woff2",
+}
 
 def _read_txt(p: Path) -> str:
     try:    return p.read_text(encoding="utf-8", errors="ignore")
@@ -128,7 +150,7 @@ def _read_pptx(p: Path) -> str:
     if not HAS_PPTX: return ""
     try:
         parts = []
-        for slide in PptxPrs(str(p)).slides:
+        for slide in Prs(str(p)).slides:
             for shape in slide.shapes:
                 if hasattr(shape, "text"): parts.append(shape.text)
         return " ".join(parts)
@@ -138,199 +160,227 @@ def _read_xlsx(p: Path) -> str:
     if not HAS_OPENPYXL: return ""
     try:
         wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
-        return " ".join(str(c) for row in wb.active.iter_rows(values_only=True)
-                        for c in row if c is not None)
+        return " ".join(
+            str(c) for row in wb.active.iter_rows(values_only=True)
+            for c in row if c is not None
+        )
     except: return ""
 
 _EXTRACTORS = {
     ".txt": _read_txt, ".md": _read_txt, ".rtf": _read_txt, ".csv": _read_txt,
-    ".pdf": _read_pdf, ".docx": _read_docx,
-    ".pptx": _read_pptx, ".xlsx": _read_xlsx,
+    ".log": _read_txt, ".json": _read_txt, ".xml": _read_txt, ".yaml": _read_txt,
+    ".py": _read_txt,  ".js": _read_txt,  ".ts": _read_txt,  ".html": _read_txt,
+    ".pdf": _read_pdf, ".docx": _read_docx, ".pptx": _read_pptx, ".xlsx": _read_xlsx,
 }
 
-def extract_text(filepath: Path, max_chars: int = 8000) -> str:
-    """Extract text from a file and truncate to max_chars."""
-    fn = _EXTRACTORS.get(filepath.suffix.lower())
-    return (fn(filepath) if fn else "")[:max_chars]
-
-
-# ════════════════════════════════════════════════════════════════
-#  SECTION 4 — SEMANTIC CLASSIFIER
-# ════════════════════════════════════════════════════════════════
-
-# Abbreviation map used to expand terse folder names into richer text.
-_ABBREV = {
-    "CS":   "computer science programming software algorithms",
-    "MATH": "mathematics calculus algebra statistics",
-    "HIST": "history civilization society politics",
-    "ENG":  "english literature writing composition",
-    "PHYS": "physics mechanics energy wave",
-    "CHEM": "chemistry elements reactions lab",
-    "BIO":  "biology cells organisms genetics",
-    "ECON": "economics market finance trade",
-    "PSYC": "psychology behavior mind cognitive",
-    "SOC":  "sociology society culture",
-    "STAT": "statistics data probability analysis",
-    "NSEC": "network security cybersecurity",
-    "NSSE": "network security forensics digital investigation",
-    "IT":   "information technology systems",
-    "ART":  "art design visual creative",
-    "GEO":  "geography spatial environment",
-}
-
-def _expand_folder_name(name: str) -> str:
+def extract_text(p: Path) -> str:
     """
-    Turn a terse folder name into a semantically rich description.
-    e.g. "CS101" → "CS 101 computer science programming software algorithms"
+    Return up to MAX_EXTRACT_CHARS of readable text from p.
+    Returns "" immediately for SKIP_EXTENSIONS — no I/O touched.
     """
-    m = re.match(r"^([A-Za-z]+)(\d*)(.*)$", name)
-    if m:
-        prefix = m.group(1).upper()
-        rest   = (m.group(2) + " " + m.group(3)).strip()
-        expand = _ABBREV.get(prefix, prefix.lower())
-        return f"{prefix} {rest} {expand}".strip()
-    return re.sub(r"[_\-]+", " ", name)
+    if p.suffix.lower() in SKIP_EXTENSIONS:
+        return ""
+    fn = _EXTRACTORS.get(p.suffix.lower())
+    return (fn(p) if fn else "")[:MAX_EXTRACT_CHARS]
 
-def _build_anchor(class_dir: Path) -> str:
+
+def parallel_extract(files: list[Path]) -> dict[Path, str]:
     """
-    Build the full semantic anchor for a class folder:
-    expanded name  +  text sampled from existing files in that folder.
+    Run extract_text() for every file in parallel using a thread pool.
+    Returns {filepath: extracted_text} dict.
+    Called once at scan start — results are cached before Ollama batching.
     """
-    parts = [_expand_folder_name(class_dir.name)]
-    if MAX_ANCHOR_FILES > 0 and class_dir.exists():
-        sampled = 0
-        for f in class_dir.iterdir():
-            if sampled >= MAX_ANCHOR_FILES: break
-            if not f.is_file() or f.name.startswith("."): continue
-            snippet = extract_text(f, MAX_ANCHOR_CHARS)
-            if snippet.strip():
-                parts.append(snippet)
-                sampled += 1
-    return " ".join(parts)
+    results: dict[Path, str] = {}
+    with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as ex:
+        future_map = {ex.submit(extract_text, f): f for f in files}
+        for future in as_completed(future_map):
+            fp = future_map[future]
+            try:    results[fp] = future.result()
+            except: results[fp] = ""
+    return results
 
 
-class SemanticClassifier:
+# ════════════════════════════════════════════════════════════════════
+#  §4  FOLDER PROFILING  — context injected into every Ollama prompt
+# ════════════════════════════════════════════════════════════════════
+
+def build_folder_profiles(classes_dir: Path, class_folders: list[str]) -> dict[str, list[str]]:
     """
-    Loads the SentenceTransformer model once, discovers class folders
-    from the filesystem, and classifies files by cosine similarity.
+    For each class folder, collect up to MAX_PROFILE_FILES existing filenames
+    (skipping system files).  Returns {folder_name: [filename, ...]}
+    Called once at scan start; costs only a single os.scandir per folder.
     """
+    profiles: dict[str, list[str]] = {}
+    for name in class_folders:
+        folder_path = classes_dir / name
+        if not folder_path.is_dir():
+            profiles[name] = []
+            continue
+        existing = []
+        try:
+            for entry in os.scandir(folder_path):
+                if entry.is_file() and not entry.name.startswith("."):
+                    existing.append(entry.name)
+                    if len(existing) >= MAX_PROFILE_FILES:
+                        break
+        except PermissionError:
+            pass
+        profiles[name] = existing
+    return profiles
 
-    def __init__(self, classes_dir: Path, progress_cb=None):
-        if not HAS_SBERT:
-            raise RuntimeError(
-                "sentence-transformers is not installed.\n"
-                "Run:  pip install sentence-transformers"
-            )
 
-        if progress_cb: progress_cb("Loading AI model  (first run: ~80 MB download)…")
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
+def format_folder_list(class_folders: list[str],
+                        profiles: dict[str, list[str]]) -> str:
+    """
+    Build the folder-list section of the Ollama prompt, including
+    the existing-file hints so the LLM can pattern-match.
 
-        # ── Discover class folders dynamically ───────────────
-        self.class_dirs = {
-            d.name: d for d in classes_dir.iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-               and d.name not in {"Review", "Unsorted"}
+    Example output line:
+      CS101 (Existing files: syllabus.pdf, python_hw1.py, midterm.docx)
+      MATH203 (No existing files yet)
+    """
+    lines = []
+    for name in class_folders:
+        existing = profiles.get(name, [])
+        if existing:
+            hint = ", ".join(existing)
+            lines.append(f"  - {name} (Existing files: {hint})")
+        else:
+            lines.append(f"  - {name} (No existing files yet)")
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  §5  OLLAMA BATCH CLASSIFIER
+#      Sends BATCH_SIZE files per request; parses per-file JSON array.
+# ════════════════════════════════════════════════════════════════════
+
+# The system prompt now includes the folder-profile hints.
+_SYSTEM_PROMPT_TEMPLATE = """\
+You are a file classification assistant. Your job is to assign each file
+in a batch to the single best-matching destination folder.
+
+Available destination folders (with hints about what is already inside each):
+{folder_list}
+
+Rules:
+- Use the folder hints (existing filenames) as strong signals.
+  If an incoming file looks like something already in a folder, prefer that folder.
+- If nothing matches well, use exactly "Unsorted".
+- Confidence must be an integer 0-100.
+- Reasoning must be ONE concise sentence.
+
+You will receive a JSON array of objects, each with:
+  "index"    : integer (preserve it in output)
+  "filename" : string
+  "content"  : string (extracted text, may be empty)
+
+Respond ONLY with a JSON array — no markdown, no code fences, no extra text.
+Each element must have exactly: index, folder, confidence, reasoning.
+
+Example response for a 2-file batch:
+[
+  {{"index":0,"folder":"CS101","confidence":88,"reasoning":"Python script matching intro CS homework pattern."}},
+  {{"index":1,"folder":"Unsorted","confidence":0,"reasoning":"Binary file with no readable content."}}
+]
+"""
+
+def _safe_folder(folder: str, class_folders: list[str]) -> tuple[str, int, str]:
+    """Validate that folder is a known name; fall back to Unsorted."""
+    if folder in class_folders or folder == "Unsorted":
+        return folder, None, None
+    # Model hallucinated — remap
+    return "Unsorted", 0, f"Model suggested unknown folder '{folder}' — remapped."
+
+
+def classify_batch_ollama(
+    batch: list[dict],          # [{"index":int, "filepath":Path, "content":str}]
+    class_folders: list[str],
+    folder_list_str: str,       # pre-formatted folder+hint string
+) -> list[dict]:
+    """
+    Send one batch to Ollama; return list of result dicts aligned to input indices.
+    Falls back gracefully on connection errors or bad JSON.
+    """
+    # Build the user payload (only filename + content go to LLM)
+    user_items = [
+        {"index": item["index"], "filename": item["filepath"].name,
+         "content": item["content"] or "(no extractable text)"}
+        for item in batch
+    ]
+    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(folder_list=folder_list_str)
+
+    payload = {
+        "model":   OLLAMA_MODEL,
+        "system":  system_prompt,
+        "prompt":  json.dumps(user_items, ensure_ascii=False),
+        "stream":  False,
+        "options": {"temperature": 0.1, "num_predict": 512},
+    }
+
+    # Default: everything unsorted if something goes wrong
+    defaults = {
+        item["index"]: {
+            "folder": "Unsorted", "confidence": 0,
+            "reasoning": "Pending — will retry or manual review needed."
         }
-        if not self.class_dirs:
-            raise RuntimeError(
-                f"No class subfolders found in:\n{classes_dir}\n\n"
-                "Please create at least one class folder first."
-            )
+        for item in batch
+    }
 
-        # ── Build + encode semantic anchors for all classes ───
-        if progress_cb: progress_cb("Building semantic class anchors…")
-        self.class_names = sorted(self.class_dirs)
-        anchors = [_build_anchor(self.class_dirs[n]) for n in self.class_names]
-        self.class_embeddings = self.model.encode(
-            anchors, convert_to_tensor=True, show_progress_bar=False
-        )
+    try:
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+        resp.raise_for_status()
+        raw = resp.json().get("response", "").strip()
 
-    def classify(self, filepath: Path) -> dict:
-        """
-        Returns a dict:
-            action      : "move" | "review" | "unsorted"
-            class_name  : str | None
-            similarity  : float (0.0–1.0)
-            confidence  : "STRONG" | "LOW" | "AMBIGUOUS" | "NONE"
-            basis       : human-readable explanation
-        """
-        ext = filepath.suffix.lower()
+        # Strip accidental markdown fences
+        raw = re.sub(r"^```(?:json)?", "", raw, flags=re.MULTILINE).strip()
+        raw = re.sub(r"```$",          "", raw, flags=re.MULTILINE).strip()
 
-        # Extension shortcuts — no meaningful text to embed
-        if ext in IMAGE_EXTENSIONS:
-            return self._no_match(0.0, "Image file — no text to embed")
-        if ext in ARCHIVE_EXTENSIONS:
-            return self._no_match(0.0, "Archive file — no text to embed")
+        # Find the JSON array — be forgiving about leading/trailing prose
+        m = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"No JSON array in response: {raw[:300]}")
 
-        # Build corpus: filename hint + extracted content
-        corpus = (
-            filepath.stem.replace("_", " ").replace("-", " ") + " "
-            + extract_text(filepath)
-        ).strip()
+        parsed = json.loads(m.group(0))
 
-        if not corpus:
-            return self._no_match(0.0, "Empty / unreadable — no text extracted")
+        for item in parsed:
+            idx        = int(item.get("index", -1))
+            folder     = str(item.get("folder", "Unsorted")).strip()
+            confidence = max(0, min(100, int(item.get("confidence", 0))))
+            reasoning  = str(item.get("reasoning", "No reasoning.")).strip()
 
-        # Encode and compare
-        file_emb = self.model.encode(corpus, convert_to_tensor=True)
-        sims     = st_util.cos_sim(file_emb, self.class_embeddings)[0]
+            # Validate folder name
+            if folder not in class_folders and folder != "Unsorted":
+                reasoning  = f"Model suggested unknown folder '{folder}'. {reasoning}"
+                folder, confidence = "Unsorted", 0
 
-        scores = sorted(
-            [(self.class_names[i], float(sims[i])) for i in range(len(self.class_names))],
-            key=lambda x: x[1], reverse=True,
-        )
-        best,  best_score  = scores[0]
-        sec_name, sec_score = scores[1] if len(scores) > 1 else ("—", 0.0)
+            if idx in defaults:
+                defaults[idx] = {"folder": folder, "confidence": confidence,
+                                  "reasoning": reasoning}
 
-        # Below minimum threshold → no match
-        if best_score < MIN_SIMILARITY:
-            return self._no_match(
-                best_score,
-                f"Best similarity {best_score:.3f} below threshold {MIN_SIMILARITY} "
-                f"(closest class: {best})",
-            )
+    except requests.exceptions.ConnectionError:
+        for idx in defaults:
+            defaults[idx]["reasoning"] = "Ollama not reachable — is 'ollama serve' running?"
+    except Exception as e:
+        log.warning(f"Ollama batch error: {e}")
+        for idx in defaults:
+            defaults[idx]["reasoning"] = f"Batch error: {str(e)[:120]}"
 
-        # Top two classes too close → ambiguous
-        if (best_score - sec_score) <= AMBIGUITY_GAP and sec_score >= MIN_SIMILARITY:
-            return {
-                "action":     "review",
-                "class_name": best,         # offer the best guess as default dest
-                "similarity": best_score,
-                "confidence": "AMBIGUOUS",
-                "basis":      (f"Tied: {best} ({best_score:.3f}) vs "
-                               f"{sec_name} ({sec_score:.3f}) — "
-                               f"gap {best_score-sec_score:.3f} ≤ {AMBIGUITY_GAP}"),
-            }
-
-        # Clear single winner
-        confidence = "STRONG" if best_score >= STRONG_THRESHOLD else "LOW"
-        return {
-            "action":     "move",
-            "class_name": best,
-            "similarity": best_score,
-            "confidence": confidence,
-            "basis":      (f"{confidence}: {best} (sim={best_score:.3f}, "
-                           f"runner-up={sec_name} @ {sec_score:.3f})"),
-        }
-
-    @staticmethod
-    def _no_match(sim, reason):
-        return {"action": "unsorted", "class_name": None,
-                "similarity": sim, "confidence": "NONE", "basis": reason}
+    return defaults   # {index: {folder, confidence, reasoning}}
 
 
-# ════════════════════════════════════════════════════════════════
-#  SECTION 5 — FILE SYSTEM HELPERS
-# ════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+#  §6  FILE SYSTEM HELPERS
+# ════════════════════════════════════════════════════════════════════
 
 def safe_resolve(p: str) -> Path:
     return Path(os.path.expanduser(p)).resolve()
 
 def is_system(f: Path) -> bool:
-    return f.name.startswith(".") or f.name in {"Thumbs.db", "desktop.ini"}
+    return f.name.startswith(".") or f.name in {"Thumbs.db", "desktop.ini", "__MACOSX"}
 
 def unique_dest(path: Path) -> Path:
-    """Return path unchanged, or path_1, path_2 … until a free name is found."""
+    """Append _1, _2, … until a free name is found. Never overwrites."""
     if not path.exists(): return path
     i = 1
     while True:
@@ -338,660 +388,996 @@ def unique_dest(path: Path) -> Path:
         if not c.exists(): return c
         i += 1
 
-
-# ════════════════════════════════════════════════════════════════
-#  SECTION 6 — REPORT GENERATION
-#  Always writes TXT + CSV regardless of DRY_RUN.
-# ════════════════════════════════════════════════════════════════
-
-def generate_reports(results: list, classes_dir: Path, dry_run: bool) -> str:
+def collect_files(source_dir: Path) -> tuple[list[Path], list[Path]]:
     """
-    Writes sorting_report.txt and sorting_report.csv.
-    Returns the full text of the report for display in the GUI.
+    Returns (top_level_files, subdir_files).
+    - top_level_files : files sitting directly in source_dir → sent to Ollama
+    - subdir_files    : files inside subdirectories → instant Unsorted (0 %)
     """
-    ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    mode = "DRY RUN — simulated, no files were moved" if dry_run else "LIVE RUN"
-
-    stats = defaultdict(int)
-    for r in results:
-        stats[r["action"]] += 1
-        stats["total"]     += 1
-
-    sep  = "═" * 72
-    dash = "─" * 72
-    lines = [
-        sep,
-        "  CLASSORT AI v2 — SORTING REPORT",
-        f"  Generated : {ts}",
-        f"  Mode      : {mode}",
-        f"  Source    : {SOURCE_FOLDER}",
-        f"  Classes   : {CLASSES_FOLDER}",
-        f"  Model     : {EMBEDDING_MODEL}",
-        sep,
-        f"  Total files processed : {stats['total']}",
-        f"  Moved / simulated     : {stats.get('moved', 0) + stats.get('simulated', 0)}",
-        f"  Errors                : {stats.get('error', 0)}",
-        "",
-        dash,
-        "  PER-FILE DETAILS",
-        dash,
-    ]
-    for r in results:
-        lines += [
-            f"\n  File        : {r['filename']}",
-            f"  Original    : {r['original_path']}",
-            f"  Destination : {r['final_dest']}",
-            f"  Final path  : {r['final_path']}",
-            f"  Action      : {r['action'].upper()}  [{r['confidence']}]",
-            f"  Similarity  : {r['similarity']:.4f}",
-            f"  Basis       : {r['basis']}",
-        ]
-    lines.append("\n" + sep)
-    report_text = "\n".join(lines)
-
-    txt_path = classes_dir / REPORT_TXT
-    csv_path = classes_dir / REPORT_CSV
-
-    # Always write — even in dry-run mode
+    top_level, subdir = [], []
     try:
-        txt_path.write_text(report_text, encoding="utf-8")
-        log.info(f"Report → {txt_path}")
-    except Exception as e:
-        log.warning(f"TXT report write failed: {e}")
+        for entry in source_dir.iterdir():
+            if entry.is_file() and not is_system(entry):
+                top_level.append(entry)
+            elif entry.is_dir() and not is_system(entry):
+                for sub_entry in entry.rglob("*"):
+                    if sub_entry.is_file() and not is_system(sub_entry):
+                        subdir.append(sub_entry)
+    except PermissionError as e:
+        log.error(f"Cannot read source folder: {e}")
+    return sorted(top_level), sorted(subdir)
 
-    fields = ["filename", "original_path", "final_dest", "final_path",
-              "action", "confidence", "similarity", "basis"]
+def discover_class_folders(classes_dir: Path) -> list[str]:
+    reserved = {"Review", "Unsorted"}
     try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            w.writerows([{k: r.get(k, "") for k in fields} for r in results])
-        log.info(f"CSV    → {csv_path}")
-    except Exception as e:
-        log.warning(f"CSV report write failed: {e}")
-
-    return report_text
+        return sorted(
+            d.name for d in classes_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and d.name not in reserved
+        )
+    except PermissionError:
+        return []
 
 
-# ════════════════════════════════════════════════════════════════
-#  SECTION 7 — COLOUR PALETTE & STYLE CONSTANTS
-# ════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+#  §7  BACKGROUND SCAN THREAD
+# ════════════════════════════════════════════════════════════════════
 
-C_STRONG    = "#E8F5E9"   # soft green  — confident match
-C_LOW       = "#FFF9C4"   # soft yellow — low confidence
-C_AMBIGUOUS = "#FFE0B2"   # soft orange — ambiguous
-C_UNSORTED  = "#FFCDD2"   # soft red    — no match
-C_DONE      = "#E3F2FD"   # light blue  — executed/simulated
-C_BG        = "#F5F5F5"   # window background
-C_HEADER    = "#263238"   # dark header bar
-C_ACCENT    = "#1565C0"   # button blue
-
-STATUS_LABELS = {
-    "STRONG":    "● Strong Match",
-    "LOW":       "◐ Low Confidence",
-    "AMBIGUOUS": "⚡ Ambiguous",
-    "NONE":      "✗ No Match",
-}
-
-
-# ════════════════════════════════════════════════════════════════
-#  SECTION 8 — TKINTER APPLICATION
-# ════════════════════════════════════════════════════════════════
-
-class ClassSortApp:
+class ScanWorker(QThread):
     """
-    Main tkinter application.
-
-    Internal state machine:
-      loading  → background thread is scanning / loading model
-      review   → treeview displayed, user can edit destinations
-      done     → execution finished, results window open
+    Runs entirely off the main thread.
+    Signals:
+      progress(current, total, status_text)
+      result_ready(results_list, dest_options_list)
+      error(message)
     """
+    progress     = pyqtSignal(int, int, str)
+    result_ready = pyqtSignal(list, list)
+    error        = pyqtSignal(str)
 
-    def __init__(self):
-        self.source_dir  = safe_resolve(SOURCE_FOLDER)
-        self.classes_dir = safe_resolve(CLASSES_FOLDER)
-        self.q           = queue.Queue()   # background thread → main thread
-        self.files_data  = []              # list of classification dicts
-        self.iid_map     = {}              # treeview row iid → files_data index
-        self.all_dests   = []              # destination choices for combobox
-        self._editor     = None            # currently open inline combobox
+    def __init__(self, source_dir: Path, classes_dir: Path):
+        super().__init__()
+        self.source_dir  = source_dir
+        self.classes_dir = classes_dir
 
-        # ── Root window ───────────────────────────────────────
-        self.root = tk.Tk()
-        self.root.title("ClassSort AI — Bulk File Organizer")
-        self.root.geometry("1020x660")
-        self.root.minsize(840, 500)
-        self.root.configure(bg=C_BG)
-
-        # "clam" theme is required for treeview row background colors on macOS.
-        # The native "aqua" theme ignores tag backgrounds.
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        self._configure_styles(style)
-
-        self._build_loading_frame()
-        self._start_scan()
-        self.root.after(150, self._poll_queue)
-        self.root.mainloop()
-
-    # ── ttk style configuration ───────────────────────────────
-    def _configure_styles(self, s: ttk.Style):
-        s.configure("TFrame",        background=C_BG)
-        s.configure("Header.TFrame", background=C_HEADER)
-        s.configure("Header.TLabel", background=C_HEADER, foreground="white",
-                                     font=("Helvetica Neue", 13, "bold"))
-        s.configure("Sub.TLabel",    background=C_HEADER, foreground="#B0BEC5",
-                                     font=("Helvetica Neue", 10))
-        s.configure("Info.TLabel",   background=C_BG,
-                                     font=("Helvetica Neue", 11))
-        s.configure("Accent.TButton", font=("Helvetica Neue", 12, "bold"),
-                                      padding=(18, 8))
-        s.configure("Treeview",
-                    rowheight=26,
-                    font=("Helvetica Neue", 11),
-                    background="white",
-                    fieldbackground="white",
-                    borderwidth=0)
-        s.configure("Treeview.Heading",
-                    font=("Helvetica Neue", 11, "bold"),
-                    background="#ECEFF1", foreground="#263238",
-                    relief="flat", padding=(6, 4))
-        s.map("Treeview",
-              background=[("selected", "#BBDEFB")],
-              foreground=[("selected", "#0D47A1")])
-
-    # ════════════════════════════════════════════════════════════
-    #  PHASE 1 — LOADING SCREEN
-    # ════════════════════════════════════════════════════════════
-
-    def _build_loading_frame(self):
-        """Simple centred loading indicator shown while the AI scan runs."""
-        self._loading = ttk.Frame(self.root, style="TFrame", padding=50)
-        self._loading.place(relx=0.5, rely=0.45, anchor="center")
-
-        tk.Label(self._loading, text="ClassSort AI",
-                 font=("Helvetica Neue", 26, "bold"),
-                 bg=C_BG, fg=C_ACCENT).pack(pady=(0, 8))
-
-        tk.Label(self._loading,
-                 text="Scanning files and building semantic class anchors…",
-                 font=("Helvetica Neue", 12), bg=C_BG, fg="#455A64").pack(pady=(0, 24))
-
-        self._pbar = ttk.Progressbar(self._loading, mode="indeterminate", length=420)
-        self._pbar.pack(pady=(0, 16))
-        self._pbar.start(10)
-
-        self._status_var = tk.StringVar(value="Initialising…")
-        tk.Label(self._loading, textvariable=self._status_var,
-                 font=("Helvetica Neue", 10), bg=C_BG, fg="#78909C").pack()
-
-    def _set_status(self, text: str):
-        """Thread-safe status update for the loading label."""
-        self.root.after(0, lambda: self._status_var.set(text))
-
-    # ════════════════════════════════════════════════════════════
-    #  BACKGROUND SCAN THREAD
-    # ════════════════════════════════════════════════════════════
-
-    def _start_scan(self):
-        threading.Thread(target=self._scan_worker, daemon=True).start()
-
-    def _scan_worker(self):
-        """
-        Runs entirely in a background thread.
-        Communicates with the main thread only via self.q.
-        """
+    # ─────────────────────────────────────────────────────────────
+    def run(self):
         try:
-            # Validate paths before loading the heavy model
+            # ── 0. Validate paths ─────────────────────────────
             for label, path in [("Source", self.source_dir),
                                  ("Classes", self.classes_dir)]:
                 if not path.exists():
-                    self.q.put({"type": "error",
-                                "msg": f"{label} folder not found:\n{path}"})
+                    self.error.emit(f"{label} folder not found:\n{path}")
                     return
 
-            # Initialise classifier (loads model + encodes class anchors)
-            classifier  = SemanticClassifier(self.classes_dir, self._set_status)
-            class_names = sorted(classifier.class_dirs.keys())
-
-            # Destination options for the combobox: class folders + Unsorted
-            dest_options = class_names + ["Unsorted"]
-
-            # Collect source files
-            self._set_status("Collecting source files…")
-            try:
-                all_files = sorted(
-                    f for f in self.source_dir.iterdir()
-                    if f.is_file() and not is_system(f)
+            # ── 1. Discover class folders ─────────────────────
+            class_folders = discover_class_folders(self.classes_dir)
+            if not class_folders:
+                self.error.emit(
+                    f"No class subfolders found in:\n{self.classes_dir}\n\n"
+                    "Create at least one class folder first."
                 )
-            except PermissionError as e:
-                self.q.put({"type": "error", "msg": f"Cannot read source folder:\n{e}"})
                 return
+            dest_options = class_folders + ["Unsorted"]
+
+            # ── 2. Build folder profiles (context for AI) ─────
+            self.progress.emit(0, 1, "Profiling destination folders…")
+            profiles       = build_folder_profiles(self.classes_dir, class_folders)
+            folder_list_str = format_folder_list(class_folders, profiles)
+
+            # ── 3. Collect source files ───────────────────────
+            self.progress.emit(0, 1, "Collecting source files…")
+            top_level_files, subdir_files = collect_files(self.source_dir)
+            all_files = top_level_files + subdir_files
 
             if not all_files:
-                self.q.put({"type": "error",
-                            "msg": "No files found in the source folder."})
+                self.error.emit("No files found in the source folder.")
                 return
 
             total   = len(all_files)
             results = []
+            idx_counter = 0
 
-            for i, filepath in enumerate(all_files, 1):
-                self._set_status(f"Classifying {i}/{total}: {filepath.name[:55]}")
-                try:
-                    r = classifier.classify(filepath)
-                except Exception:
-                    r = {"action": "unsorted", "class_name": None,
-                         "similarity": 0.0, "confidence": "NONE",
-                         "basis": f"Error: {traceback.format_exc(limit=1).strip()}"}
+            # ── 4. Instant-Unsorted for subfolder files ───────
+            for filepath in subdir_files:
+                try:    rel_path = filepath.relative_to(self.source_dir)
+                except: rel_path = Path(filepath.name)
 
-                action     = r["action"]
-                class_name = r.get("class_name")    # may be set even for "review"
-                confidence = r.get("confidence", "NONE")
-                similarity = r.get("similarity", 0.0)
-                basis      = r.get("basis", "")
+                results.append(self._make_record(
+                    idx_counter, filepath, rel_path,
+                    folder="Unsorted", confidence=0, tier="unsorted",
+                    reasoning="File is inside a subfolder — moved to Unsorted automatically.",
+                ))
+                idx_counter += 1
 
-                # Determine the AI's suggested destination to show as default.
-                # For ambiguous files we still suggest the best-matching class
-                # (the user can override it in the GUI).
-                if action in ("move", "review") and class_name:
-                    default_dest = class_name
-                else:
-                    default_dest = "Unsorted"
+            # ── 5. Parallel text extraction (top-level only) ──
+            self.progress.emit(0, total, "Extracting text from files (parallel)…")
+            extracted = parallel_extract(top_level_files)
 
-                results.append({
-                    "index":        i - 1,
-                    "filepath":     filepath,
-                    "filename":     filepath.name,
-                    "original_path": str(filepath),
-                    "ai_dest":      default_dest,   # immutable AI suggestion
-                    "current_dest": default_dest,   # user may override in GUI
-                    "similarity":   similarity,
-                    "confidence":   confidence,
-                    "action":       action,
-                    "basis":        basis,
-                    # filled after Execute:
-                    "final_dest":   default_dest,
-                    "final_path":   "",
-                    "executed":     False,
+            # ── 6. Ollama batching ────────────────────────────
+            batch_input = []
+            for filepath in top_level_files:
+                try:    rel_path = filepath.relative_to(self.source_dir)
+                except: rel_path = Path(filepath.name)
+
+                batch_input.append({
+                    "index":    idx_counter,   # global index
+                    "filepath": filepath,
+                    "rel_path": rel_path,
+                    "content":  extracted.get(filepath, ""),
                 })
+                idx_counter += 1
 
-            self.q.put({
-                "type":         "done",
-                "results":      results,
-                "dest_options": dest_options,
-            })
+            processed = 0
+            for batch_start in range(0, len(batch_input), BATCH_SIZE):
+                batch   = batch_input[batch_start: batch_start + BATCH_SIZE]
+                names   = ", ".join(b["filepath"].name for b in batch)
+                processed += len(batch)
+                self.progress.emit(
+                    processed, len(top_level_files),
+                    f"Batch {batch_start // BATCH_SIZE + 1}: {names[:80]}…"
+                )
 
-        except Exception as e:
-            self.q.put({"type": "error", "msg": str(e)})
+                ai_results = classify_batch_ollama(batch, class_folders, folder_list_str)
 
-    # ── Queue poller ──────────────────────────────────────────
-    def _poll_queue(self):
-        """Check for background thread results every 150 ms."""
-        try:
-            msg = self.q.get_nowait()
-            if msg["type"] == "done":
-                self._pbar.stop()
-                self._loading.destroy()
-                self.files_data = msg["results"]
-                self.all_dests  = msg["dest_options"]
-                self._build_review_ui()
-            elif msg["type"] == "error":
-                self._pbar.stop()
-                self._loading.destroy()
-                messagebox.showerror("ClassSort — Error", msg["msg"])
-                self.root.destroy()
-                return
-        except queue.Empty:
-            pass
-        self.root.after(150, self._poll_queue)
+                for item in batch:
+                    ai     = ai_results.get(item["index"], {})
+                    folder = ai.get("folder", "Unsorted")
+                    conf   = ai.get("confidence", 0)
+                    reason = ai.get("reasoning", "No reasoning.")
 
-    # ════════════════════════════════════════════════════════════
-    #  PHASE 2 — BULK REVIEW GUI
-    # ════════════════════════════════════════════════════════════
+                    if folder == "Unsorted" or conf < MEDIUM_CONFIDENCE:
+                        tier, dest = "unsorted", "Unsorted"
+                    elif conf < HIGH_CONFIDENCE:
+                        tier, dest = "review",   folder
+                    else:
+                        tier, dest = "auto",     folder
 
-    def _build_review_ui(self):
-        # ── Header ────────────────────────────────────────────
-        hdr = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 11))
-        hdr.pack(fill="x")
-        ttk.Label(hdr, text="ClassSort AI — Bulk Review",
-                  style="Header.TLabel").pack(side="left")
-        mode_lbl = "  🔵 DRY RUN  " if DRY_RUN else "  🟢 LIVE  "
-        ttk.Label(hdr, text=mode_lbl, style="Sub.TLabel").pack(side="left", padx=8)
-        n = len(self.files_data)
-        ttk.Label(hdr, text=f"{n} file{'s' if n != 1 else ''} ready for review",
-                  style="Sub.TLabel").pack(side="right", padx=6)
+                    results.append(self._make_record(
+                        item["index"], item["filepath"], item["rel_path"],
+                        folder=dest, confidence=conf, tier=tier,
+                        reasoning=reason,
+                    ))
 
-        # ── Instruction strip ─────────────────────────────────
-        instr = tk.Frame(self.root, bg="#ECEFF1")
-        instr.pack(fill="x")
-        tk.Label(instr,
-                 text=" ↖  Click any cell in the  Destination  column to reassign a file."
-                      "  Highlighted rows need your attention.  Then press  Execute Moves.",
-                 font=("Helvetica Neue", 10), bg="#ECEFF1", fg="#455A64",
-                 pady=5).pack(side="left", padx=10)
+            # Sort by original index so UI order matches filesystem order
+            results.sort(key=lambda r: r["index"])
+            self.result_ready.emit(results, dest_options)
 
-        # ── Treeview container ────────────────────────────────
-        tv_frame = ttk.Frame(self.root, padding=(10, 6, 10, 0))
-        tv_frame.pack(fill="both", expand=True)
+        except Exception:
+            self.error.emit(traceback.format_exc())
 
-        cols = ("filename", "destination", "confidence", "status")
-        self.tree = ttk.Treeview(tv_frame, columns=cols,
-                                 show="headings", selectmode="browse")
+    # ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _make_record(index, filepath, rel_path, folder, confidence, tier, reasoning):
+        return {
+            "index":        index,
+            "filepath":     filepath,
+            "rel_path":     rel_path,
+            "rel_str":      str(rel_path),
+            "filename":     filepath.name,
+            "original_path": str(filepath),
+            "ai_folder":    folder,
+            "current_dest": folder,
+            "confidence":   confidence,
+            "reasoning":    reasoning,
+            "tier":         tier,
+            "final_dest":   folder,
+            "final_path":   "",
+            "action":       "",
+        }
 
-        # Column definitions
-        self.tree.heading("filename",    text="Original Filename",  anchor="w")
-        self.tree.heading("destination", text="▼ Destination",      anchor="w")
-        self.tree.heading("confidence",  text="Confidence",         anchor="center")
-        self.tree.heading("status",      text="Status",             anchor="w")
 
-        self.tree.column("filename",    width=330, minwidth=180, stretch=True,  anchor="w")
-        self.tree.column("destination", width=190, minwidth=120, stretch=False, anchor="w")
-        self.tree.column("confidence",  width=100, minwidth=80,  stretch=False, anchor="center")
-        self.tree.column("status",      width=175, minwidth=130, stretch=False, anchor="w")
+# ════════════════════════════════════════════════════════════════════
+#  §8  CUSTOM PAINTED WIDGETS
+# ════════════════════════════════════════════════════════════════════
 
-        # Row colour tags — requires "clam" theme (set in __init__)
-        self.tree.tag_configure("STRONG",    background=C_STRONG)
-        self.tree.tag_configure("LOW",       background=C_LOW)
-        self.tree.tag_configure("AMBIGUOUS", background=C_AMBIGUOUS)
-        self.tree.tag_configure("NONE",      background=C_UNSORTED)
-        self.tree.tag_configure("DONE",      background=C_DONE)
+class ScorePill(QWidget):
+    """
+    Rounded pill — green (High ≥75) / amber (Medium 40-74) / red (Low <40).
+    Painted with QPainter so border-radius works without QSS hacks.
+    """
+    _STYLES = {
+        "high":   ("#DCFCE7", "#15803D", "High"),
+        "medium": ("#FEF3C7", "#B45309", "Medium"),
+        "low":    ("#FEE2E2", "#B91C1C", "Low"),
+    }
 
-        # Scrollbars
-        vsb = ttk.Scrollbar(tv_frame, orient="vertical",   command=self.tree.yview)
-        hsb = ttk.Scrollbar(tv_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        tv_frame.rowconfigure(0, weight=1)
-        tv_frame.columnconfigure(0, weight=1)
+    def __init__(self, confidence: int, parent=None):
+        super().__init__(parent)
+        if confidence >= HIGH_CONFIDENCE:
+            self._bg, self._fg, self._text = self._STYLES["high"]
+        elif confidence >= MEDIUM_CONFIDENCE:
+            self._bg, self._fg, self._text = self._STYLES["medium"]
+        else:
+            self._bg, self._fg, self._text = self._STYLES["low"]
 
-        # Bind click for inline destination editing
-        self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
+        self._conf = confidence
+        self.setFixedHeight(26)
+        fm = self.fontMetrics()
+        # Width for pill text  +  small numeric badge
+        badge_text = f"{self._text} · {confidence}%"
+        self.setFixedWidth(fm.horizontalAdvance(badge_text) + 28)
+        self._badge_text = badge_text
 
-        # ── Legend ────────────────────────────────────────────
-        legend = tk.Frame(self.root, bg=C_BG)
-        legend.pack(fill="x", padx=12, pady=(4, 0))
-        tk.Label(legend, text="Legend: ", font=("Helvetica Neue", 9, "bold"),
-                 bg=C_BG).pack(side="left")
-        for colour, label in [
-            (C_STRONG,    "Strong Match"),
-            (C_LOW,       "Low Confidence"),
-            (C_AMBIGUOUS, "Ambiguous — needs review"),
-            (C_UNSORTED,  "No Match → Unsorted"),
-        ]:
-            tk.Label(legend, text=f"  {label}  ", bg=colour,
-                     font=("Helvetica Neue", 9), padx=5, pady=2,
-                     relief="flat").pack(side="left", padx=(0, 8))
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, self.width(), self.height()), 7, 7)
+        p.fillPath(path, QBrush(QColor(self._bg)))
+        p.setPen(QPen(QColor(self._fg)))
+        font = QFont()
+        font.setPointSize(10)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._badge_text)
+        p.end()
 
-        # ── Bottom action bar ─────────────────────────────────
-        bottom = tk.Frame(self.root, bg=C_BG)
-        bottom.pack(fill="x", padx=12, pady=8)
 
-        self._stats_var = tk.StringVar()
-        tk.Label(bottom, textvariable=self._stats_var,
-                 font=("Helvetica Neue", 10), bg=C_BG, fg="#607D8B").pack(side="left")
+class StatusDot(QWidget):
+    """Green ✓ circle (auto tier) or gray ○ (review/unsorted)."""
+    def __init__(self, checked: bool, parent=None):
+        super().__init__(parent)
+        self.checked = checked
+        self.setFixedSize(22, 22)
 
-        btn_label = "  🔵 Simulate Moves (Dry Run)  " if DRY_RUN else "  ✅ Execute Moves  "
-        self._exec_btn = ttk.Button(
-            bottom, text=btn_label, style="Accent.TButton",
-            command=self._execute_moves,
-        )
-        self._exec_btn.pack(side="right")
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy, r = self.width() / 2, self.height() / 2, 8.5
+        if self.checked:
+            p.setPen(QPen(QColor("#22C55E"), 1.5))
+            p.setBrush(QBrush(QColor("#DCFCE7")))
+            p.drawEllipse(QRectF(cx - r, cy - r, 2*r, 2*r))
+            p.setPen(QPen(QColor("#16A34A"), 2,
+                          Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            path = QPainterPath()
+            path.moveTo(cx - 3.5, cy)
+            path.lineTo(cx - 1,   cy + 3)
+            path.lineTo(cx + 4,   cy - 3)
+            p.drawPath(path)
+        else:
+            p.setPen(QPen(QColor("#D1D5DB"), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(cx - r, cy - r, 2*r, 2*r))
+        p.end()
 
-        # Populate rows and stats
-        self._populate_tree()
-        self._refresh_stats()
 
-    # ── Populate treeview ─────────────────────────────────────
-    def _populate_tree(self):
-        self.tree.delete(*self.tree.get_children())
-        self.iid_map.clear()
+class FlatCombo(QComboBox):
+    """Minimal flat combobox for the Destination column."""
+    def __init__(self, options: list[str], current: str, parent=None):
+        super().__init__(parent)
+        self.addItems(options)
+        idx = self.findText(current)
+        if idx >= 0: self.setCurrentIndex(idx)
+        self.setFixedHeight(30)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        for data in self.files_data:
-            idx  = data["index"]
-            iid  = str(idx)
-            conf = data["confidence"]
-            pct  = f"{data['similarity'] * 100:.1f}%"
-            self.tree.insert(
-                "", "end", iid=iid,
-                values=(data["filename"], data["current_dest"],
-                        pct, STATUS_LABELS.get(conf, conf)),
-                tags=(conf,),
+
+# ════════════════════════════════════════════════════════════════════
+#  §9  BACKGROUND GRADIENT + WHITE CARD
+# ════════════════════════════════════════════════════════════════════
+
+class GradientBackground(QWidget):
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        grad = QLinearGradient(0, 0, self.width(), self.height())
+        grad.setColorAt(0.0, QColor("#EDE9FE"))
+        grad.setColorAt(0.5, QColor("#F3F0FF"))
+        grad.setColorAt(1.0, QColor("#EEF2FF"))
+        p.fillRect(self.rect(), QBrush(grad))
+        p.end()
+
+
+class WhiteCard(QWidget):
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 16, 16)
+        p.fillPath(path, QBrush(QColor("#FFFFFF")))
+        p.end()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  §10  QSS STYLESHEET
+# ════════════════════════════════════════════════════════════════════
+
+QSS = """
+* {
+    font-family: "SF Pro Text", "Helvetica Neue", sans-serif;
+    font-size: 13px;
+    color: #111827;
+}
+
+/* ── Sidebar ───────────────────────────────────────────── */
+#Sidebar {
+    background: transparent;
+    border-right: 1px solid #F3F4F6;
+    min-width: 212px;
+    max-width: 212px;
+}
+#LogoDot {
+    color: #7C3AED;
+    font-size: 20px;
+    font-weight: 900;
+}
+#LogoLabel {
+    color: #111827;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+}
+
+/* Sidebar stat tiles */
+#StatTile {
+    background: #F9FAFB;
+    border-radius: 9px;
+    padding: 1px;
+}
+#StatNumber { color: #111827; font-size: 20px; font-weight: 700; }
+#StatDesc   { color: #9CA3AF; font-size: 10px; }
+
+/* Mode badge */
+#ModeBadge {
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 10px;
+    margin: 0 14px;
+}
+
+/* Execute button */
+QPushButton#ExecBtn {
+    background-color: #7C3AED;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 0px;
+    margin: 4px 14px 18px 14px;
+}
+QPushButton#ExecBtn:hover    { background-color: #6D28D9; }
+QPushButton#ExecBtn:pressed  { background-color: #5B21B6; }
+QPushButton#ExecBtn:disabled { background-color: #E5E7EB; color: #9CA3AF; }
+
+/* ── Content area ──────────────────────────────────────── */
+#ContentArea { background: transparent; }
+#PageTitle   { font-size: 15px; font-weight: 700; letter-spacing: -0.2px; }
+#PageSubtitle{ font-size: 11px; color: #9CA3AF; }
+
+/* ── Loading ───────────────────────────────────────────── */
+#LoadTitle  { font-size: 16px; font-weight: 700; }
+#LoadStatus { font-size: 11px; color: #9CA3AF; }
+QProgressBar {
+    background: #F3F4F6; border: none;
+    border-radius: 4px; height: 6px; font-size: 0px;
+}
+QProgressBar::chunk { background: #7C3AED; border-radius: 4px; }
+
+/* ── Table ─────────────────────────────────────────────── */
+QTableWidget {
+    background-color: #FFFFFF;
+    border: none;
+    border-radius: 12px;
+    gridline-color: transparent;
+    outline: 0;
+    selection-background-color: #F5F3FF;
+    selection-color: #111827;
+}
+QTableWidget::item {
+    border: none;
+    border-bottom: 1px solid #F9FAFB;
+    padding: 0px 6px;
+}
+QTableWidget::item:selected { background-color: #F5F3FF; }
+QHeaderView { background: transparent; }
+QHeaderView::section {
+    background-color: #FFFFFF;
+    color: #9CA3AF;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    border: none;
+    border-bottom: 1px solid #F3F4F6;
+    padding: 9px 6px;
+}
+QScrollBar:vertical {
+    background: transparent; width: 6px; margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #E5E7EB; border-radius: 3px; min-height: 24px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { height: 6px; }
+QScrollBar::handle:horizontal { background: #E5E7EB; border-radius: 3px; }
+
+/* ── FlatCombo ─────────────────────────────────────────── */
+FlatCombo, QComboBox {
+    background: #F9FAFB;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 3px 8px;
+    color: #374151;
+    font-size: 12px;
+}
+FlatCombo:hover, QComboBox:hover {
+    border: 1px solid #DDD6FE;
+    background: #F5F3FF;
+}
+FlatCombo:on, QComboBox:on { border: 1px solid #7C3AED; }
+QComboBox::drop-down { border: none; width: 0px; }
+QComboBox QAbstractItemView {
+    background: #FFFFFF;
+    border: 1px solid #E5E7EB;
+    border-radius: 8px;
+    selection-background-color: #F5F3FF;
+    selection-color: #5B21B6;
+    padding: 3px;
+}
+"""
+
+
+# ════════════════════════════════════════════════════════════════════
+#  §11  LOADING SCREEN
+# ════════════════════════════════════════════════════════════════════
+
+class LoadingScreen(QWidget):
+    _SPIN = ["◜", "◝", "◞", "◟"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._idx = 0
+        v = QVBoxLayout(self)
+        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.setSpacing(14)
+        v.setContentsMargins(60, 60, 60, 60)
+
+        self._spin_lbl = QLabel(self._SPIN[0])
+        self._spin_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._spin_lbl.setStyleSheet("font-size:32px; color:#7C3AED; background:transparent;")
+        v.addWidget(self._spin_lbl)
+
+        title = QLabel("Analysing files with Ollama")
+        title.setObjectName("LoadTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("background:transparent;")
+        v.addWidget(title)
+
+        self._status = QLabel("Starting…")
+        self._status.setObjectName("LoadStatus")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setStyleSheet("background:transparent;")
+        v.addWidget(self._status)
+
+        v.addSpacing(6)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 1)
+        self._bar.setValue(0)
+        self._bar.setFixedWidth(360)
+        self._bar.setFixedHeight(6)
+        v.addWidget(self._bar, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self._counter = QLabel("0 / 0")
+        self._counter.setObjectName("LoadStatus")
+        self._counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._counter.setStyleSheet("background:transparent;")
+        v.addWidget(self._counter)
+
+        timer = QTimer(self)
+        timer.timeout.connect(self._tick)
+        timer.start(110)
+
+    def _tick(self):
+        self._idx = (self._idx + 1) % len(self._SPIN)
+        self._spin_lbl.setText(self._SPIN[self._idx])
+
+    def update_progress(self, current: int, total: int, text: str):
+        self._bar.setRange(0, max(total, 1))
+        self._bar.setValue(current)
+        self._counter.setText(f"{current} / {total}")
+        short = text if len(text) <= 70 else "…" + text[-67:]
+        self._status.setText(short)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  §12  SIDEBAR  (cleaned — no fake nav, no user row)
+# ════════════════════════════════════════════════════════════════════
+
+class Sidebar(QWidget):
+    execute_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Sidebar")
+        self._build()
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # ── Logo ──────────────────────────────────────────────
+        logo_row = QWidget()
+        logo_row.setStyleSheet("background:transparent;")
+        lh = QHBoxLayout(logo_row)
+        lh.setContentsMargins(16, 22, 16, 18)
+        lh.setSpacing(6)
+
+        dot = QLabel("l.")
+        dot.setObjectName("LogoDot")
+        dot.setStyleSheet("background:transparent;")
+        lh.addWidget(dot)
+
+        name = QLabel("ClassSort AI")
+        name.setObjectName("LogoLabel")
+        name.setStyleSheet("background:transparent;")
+        lh.addWidget(name)
+        lh.addStretch()
+        v.addWidget(logo_row)
+
+        # ── Divider ───────────────────────────────────────────
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet("color:#F3F4F6; background:#F3F4F6; max-height:1px;")
+        v.addWidget(div)
+        v.addSpacing(14)
+
+        # ── Stat tiles ────────────────────────────────────────
+        self._stat_refs: dict[str, QLabel] = {}
+        for key, label in [("total", "Files found"), ("auto",   "Auto-move"),
+                             ("review","Needs review"), ("unsorted","Unsorted")]:
+            tile = self._make_tile(label)
+            v.addWidget(tile)
+            v.addSpacing(4)
+            self._stat_refs[key] = tile._val_label
+
+        v.addStretch()
+
+        # ── Divider ───────────────────────────────────────────
+        div2 = QFrame()
+        div2.setFrameShape(QFrame.Shape.HLine)
+        div2.setStyleSheet("color:#F3F4F6; background:#F3F4F6; max-height:1px;")
+        v.addWidget(div2)
+        v.addSpacing(10)
+
+        # ── Mode badge ────────────────────────────────────────
+        mode_badge = QLabel("🔵  DRY RUN" if DRY_RUN else "🟢  LIVE")
+        mode_badge.setObjectName("ModeBadge")
+        mode_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if DRY_RUN:
+            mode_badge.setStyleSheet(
+                "background:#EFF6FF; color:#1D4ED8; border-radius:6px; "
+                "font-size:11px; font-weight:600; padding:4px 10px; margin:0 14px;"
             )
-            self.iid_map[iid] = idx
+        else:
+            mode_badge.setStyleSheet(
+                "background:#F0FDF4; color:#15803D; border-radius:6px; "
+                "font-size:11px; font-weight:600; padding:4px 10px; margin:0 14px;"
+            )
+        v.addWidget(mode_badge)
+        v.addSpacing(8)
 
-    def _refresh_stats(self):
-        c = defaultdict(int)
-        for d in self.files_data: c[d["confidence"]] += 1
-        self._stats_var.set(
-            f"Total: {len(self.files_data)}    "
-            f"Strong: {c['STRONG']}    "
-            f"Low: {c['LOW']}    "
-            f"Ambiguous: {c['AMBIGUOUS']}    "
-            f"Unmatched: {c['NONE']}"
+        # ── Execute button ────────────────────────────────────
+        self._exec_btn = QPushButton(
+            "⟳  Simulate Moves" if DRY_RUN else "↗  Execute Moves"
         )
+        self._exec_btn.setObjectName("ExecBtn")
+        self._exec_btn.setEnabled(False)
+        self._exec_btn.clicked.connect(self.execute_clicked.emit)
+        v.addWidget(self._exec_btn)
 
-    # ════════════════════════════════════════════════════════════
-    #  INLINE DESTINATION EDITOR
-    # ════════════════════════════════════════════════════════════
+    def _make_tile(self, desc: str) -> QWidget:
+        tile = QWidget()
+        tile.setObjectName("StatTile")
+        tile.setStyleSheet(
+            "background:#F9FAFB; border-radius:9px; margin:0 14px;"
+        )
+        h = QHBoxLayout(tile)
+        h.setContentsMargins(12, 8, 12, 8)
 
-    def _dismiss_editor(self):
-        """Safely destroy the floating combobox if it exists."""
-        if self._editor and self._editor.winfo_exists():
-            self._editor.destroy()
-        self._editor = None
+        desc_lbl = QLabel(desc)
+        desc_lbl.setStyleSheet("color:#9CA3AF; font-size:11px; background:transparent;")
+        h.addWidget(desc_lbl)
+        h.addStretch()
 
-    def _on_tree_click(self, event):
-        """
-        Fires on every mouse release inside the treeview.
-        Opens a combobox editor only when the click lands on the
-        destination column of a non-executed row.
-        """
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
-            self._dismiss_editor()
-            return
+        val_lbl = QLabel("—")
+        val_lbl.setStyleSheet(
+            "color:#111827; font-size:14px; font-weight:700; background:transparent;"
+        )
+        h.addWidget(val_lbl)
 
-        col = self.tree.identify_column(event.x)  # "#1", "#2", …
-        iid = self.tree.identify_row(event.y)
+        tile._val_label = val_lbl   # store ref for updates
+        return tile
 
-        if col != "#2" or not iid:                 # only destination column
-            self._dismiss_editor()
-            return
+    def set_stats(self, total: int, auto: int, review: int, unsorted: int):
+        self._stat_refs["total"].setText(str(total))
+        self._stat_refs["auto"].setText(str(auto))
+        self._stat_refs["review"].setText(str(review))
+        self._stat_refs["unsorted"].setText(str(unsorted))
 
-        idx = self.iid_map.get(iid)
-        if idx is None or self.files_data[idx].get("executed"):
-            return
+    def enable_execute(self, enabled: bool = True):
+        self._exec_btn.setEnabled(enabled)
 
-        # Small delay ensures any prior dismiss fires first
-        self.root.after(30, lambda i=iid: self._open_dest_editor(i))
 
-    def _open_dest_editor(self, iid: str):
-        """
-        Place a ttk.Combobox directly over the destination cell.
-        Uses the cell's bounding box (relative to the treeview widget)
-        for precise positioning.
-        """
-        self._dismiss_editor()
+# ════════════════════════════════════════════════════════════════════
+#  §13  CONTENT AREA  (cleaned — no fake tabs, no filter bar)
+# ════════════════════════════════════════════════════════════════════
 
-        bbox = self.tree.bbox(iid, "destination")
-        if not bbox:
-            return   # row scrolled out of view
+class ContentArea(QWidget):
+    dest_changed = pyqtSignal(int, str)   # (file_index, new_destination)
 
-        x, y, w, h = bbox
-        idx         = self.iid_map[iid]
-        current     = self.files_data[idx]["current_dest"]
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ContentArea")
+        self._v = QVBoxLayout(self)
+        self._v.setContentsMargins(28, 22, 28, 20)
+        self._v.setSpacing(0)
+        self._combos: dict[int, FlatCombo] = {}
+        self._build_header()
 
-        cb = ttk.Combobox(self.tree, values=self.all_dests,
-                          state="readonly", font=("Helvetica Neue", 11))
-        cb.set(current)
-        cb.place(x=x, y=y, width=w, height=h)
-        cb.focus_set()
-        self._editor = cb
+    def _build_header(self):
+        row = QHBoxLayout()
+        row.setSpacing(8)
 
-        def on_select(_event):
-            new_dest = cb.get()
-            self.files_data[idx]["current_dest"] = new_dest
-            old = list(self.tree.item(iid, "values"))
-            old[1] = new_dest
-            self.tree.item(iid, values=old)
-            self._dismiss_editor()
-            self._refresh_stats()
+        icon = QLabel("⊟")
+        icon.setStyleSheet("font-size:14px; color:#9CA3AF; background:transparent;")
+        row.addWidget(icon)
 
-        cb.bind("<<ComboboxSelected>>", on_select)
-        cb.bind("<FocusOut>",            lambda e: self._dismiss_editor())
-        cb.bind("<Escape>",              lambda e: self._dismiss_editor())
+        title = QLabel("Files")
+        title.setObjectName("PageTitle")
+        title.setStyleSheet("background:transparent;")
+        row.addWidget(title)
+        row.addStretch()
 
-    # ════════════════════════════════════════════════════════════
-    #  PHASE 3 — EXECUTE MOVES
-    # ════════════════════════════════════════════════════════════
+        self._subtitle = QLabel("")
+        self._subtitle.setObjectName("PageSubtitle")
+        self._subtitle.setStyleSheet("background:transparent;")
+        row.addWidget(self._subtitle)
 
+        self._v.addLayout(row)
+        self._v.addSpacing(20)
+
+    def show_loading(self):
+        self._loading = LoadingScreen()
+        self._v.addWidget(self._loading, stretch=1)
+
+    def update_loading(self, current: int, total: int, text: str):
+        if hasattr(self, "_loading"):
+            self._loading.update_progress(current, total, text)
+
+    def show_table(self, files_data: list, dest_options: list):
+        if hasattr(self, "_loading"):
+            self._loading.setParent(None)
+            self._loading.deleteLater()
+
+        self._combos.clear()
+        n = len(files_data)
+        self._subtitle.setText(f"{n} file{'s' if n != 1 else ''} · click Destination to reassign")
+
+        # ── 5-column table ────────────────────────────────────
+        # Columns: # · File · Score · Destination · Type
+        cols = ["#", "File", "Score", "Destination", "Type"]
+        self._table = QTableWidget(n, len(cols))
+        self._table.setHorizontalHeaderLabels(cols)
+        self._table.setShowGrid(False)
+        self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._table.setSizeAdjustPolicy(
+            QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents
+        )
+        self._table.verticalHeader().setDefaultSectionSize(52)
+
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)        # #
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)      # File
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)        # Score
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)        # Destination
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)        # Type
+        self._table.setColumnWidth(0, 40)
+        self._table.setColumnWidth(2, 148)
+        self._table.setColumnWidth(3, 200)
+        self._table.setColumnWidth(4, 64)
+
+        for row, data in enumerate(files_data):
+            self._fill_row(row, data, dest_options)
+
+        self._v.addWidget(self._table, stretch=1)
+
+    def _fill_row(self, row: int, data: dict, dest_options: list):
+        # ── Col 0 — row number ────────────────────────────────
+        num = QTableWidgetItem(str(row + 1))
+        num.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        num.setForeground(QColor("#D1D5DB"))
+        self._table.setItem(row, 0, num)
+
+        # ── Col 1 — filename (bold) + reasoning tooltip ───────
+        fname_widget = QWidget()
+        fname_widget.setStyleSheet("background:transparent;")
+        fh = QHBoxLayout(fname_widget)
+        fh.setContentsMargins(6, 0, 6, 0)
+        fh.setSpacing(4)
+
+        fn_lbl = QLabel(f"<b>{data['filename']}</b>")
+        fn_lbl.setStyleSheet("color:#111827; font-size:13px; background:transparent;")
+        fn_lbl.setToolTip(
+            f"Path: {data['original_path']}\n\nAI Reasoning: {data['reasoning']}"
+        )
+        fh.addWidget(fn_lbl)
+
+        # Sub-path hint if file is from a subfolder
+        if len(data["rel_path"].parts) > 1:
+            sub_lbl = QLabel(f"  {data['rel_path'].parent}")
+            sub_lbl.setStyleSheet(
+                "color:#9CA3AF; font-size:10px; background:transparent;"
+            )
+            fh.addWidget(sub_lbl)
+
+        fh.addStretch()
+        self._table.setCellWidget(row, 1, fname_widget)
+
+        # ── Col 2 — score pill ────────────────────────────────
+        pill_wrap = QWidget()
+        pill_wrap.setStyleSheet("background:transparent;")
+        ph = QHBoxLayout(pill_wrap)
+        ph.setContentsMargins(8, 0, 8, 0)
+        ph.addWidget(ScorePill(data["confidence"]))
+        ph.addStretch()
+        self._table.setCellWidget(row, 2, pill_wrap)
+
+        # ── Col 3 — destination combobox ──────────────────────
+        combo = FlatCombo(dest_options, data["current_dest"])
+        file_idx = data["index"]
+        combo.currentTextChanged.connect(
+            lambda t, i=file_idx: self.dest_changed.emit(i, t)
+        )
+        self._table.setCellWidget(row, 3, combo)
+        self._combos[file_idx] = combo
+
+        # ── Col 4 — file extension badge ─────────────────────
+        ext      = data["filepath"].suffix.upper().lstrip(".") or "—"
+        ext_lbl  = QLabel(ext)
+        ext_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        ext_lbl.setStyleSheet(
+            "color:#6B7280; font-size:10px; font-weight:600; background:transparent;"
+        )
+        ext_wrap = QWidget()
+        ext_wrap.setStyleSheet("background:transparent;")
+        ew = QHBoxLayout(ext_wrap)
+        ew.setContentsMargins(4, 0, 4, 0)
+        ew.addWidget(ext_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._table.setCellWidget(row, 4, ext_wrap)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  §14  MAIN WINDOW
+# ════════════════════════════════════════════════════════════════════
+
+class ClassSortWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.source_dir   = safe_resolve(SOURCE_FOLDER)
+        self.classes_dir  = safe_resolve(CLASSES_FOLDER)
+        self.files_data:  list = []
+        self.dest_options: list = []
+        self._worker = None
+
+        self.setWindowTitle("ClassSort AI")
+        self.resize(1200, 740)
+        self.setMinimumSize(940, 580)
+
+        self._build_ui()
+        self._start_scan()
+
+    # ── Shell ─────────────────────────────────────────────────
+    def _build_ui(self):
+        bg = GradientBackground()
+        self.setCentralWidget(bg)
+
+        outer = QHBoxLayout(bg)
+        outer.setContentsMargins(20, 20, 20, 20)
+
+        card = WhiteCard()
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(48)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(109, 40, 217, 32))
+        card.setGraphicsEffect(shadow)
+
+        card_h = QHBoxLayout(card)
+        card_h.setContentsMargins(0, 0, 0, 0)
+        card_h.setSpacing(0)
+
+        self._sidebar = Sidebar()
+        self._sidebar.execute_clicked.connect(self._execute_moves)
+        card_h.addWidget(self._sidebar)
+
+        self._content = ContentArea()
+        self._content.dest_changed.connect(self._on_dest_changed)
+        card_h.addWidget(self._content, stretch=1)
+
+        outer.addWidget(card)
+
+    # ── Scan ──────────────────────────────────────────────────
+    def _start_scan(self):
+        self._content.show_loading()
+        self._worker = ScanWorker(self.source_dir, self.classes_dir)
+        self._worker.progress.connect(
+            lambda c, t, txt: self._content.update_loading(c, t, txt)
+        )
+        self._worker.result_ready.connect(self._on_scan_done)
+        self._worker.error.connect(self._on_scan_error)
+        self._worker.start()
+
+    def _on_scan_error(self, msg: str):
+        QMessageBox.critical(self, "ClassSort Error", msg)
+        self.close()
+
+    def _on_scan_done(self, results: list, dest_options: list):
+        self.files_data   = results
+        self.dest_options = dest_options
+
+        auto    = sum(1 for d in results if d["tier"] == "auto")
+        review  = sum(1 for d in results if d["tier"] == "review")
+        unsorted = sum(1 for d in results if d["tier"] == "unsorted")
+        self._sidebar.set_stats(len(results), auto, review, unsorted)
+        self._content.show_table(results, dest_options)
+        self._sidebar.enable_execute(True)
+
+    def _on_dest_changed(self, index: int, new_dest: str):
+        self.files_data[index]["current_dest"] = new_dest
+
+    # ── Execute ───────────────────────────────────────────────
     def _execute_moves(self):
-        self._dismiss_editor()
-
         n    = len(self.files_data)
-        mode = "DRY RUN (simulation)" if DRY_RUN else "LIVE"
-        note = ("Files will NOT be moved — this is a simulation.\n"
-                if DRY_RUN else
-                "Files will be PERMANENTLY MOVED to their destinations.\n")
+        mode = "DRY RUN" if DRY_RUN else "LIVE"
+        note = ("No files will be moved — simulation only.\n"
+                if DRY_RUN else "Files WILL be permanently moved.\n")
 
-        if not messagebox.askyesno(
-            "Confirm",
-            f"Mode: {mode}\n\n"
-            f"{note}"
-            f"Processing {n} file{'s' if n != 1 else ''}.\n\n"
-            "Reports (TXT + CSV) will be written to the Classes folder either way.\n\n"
-            "Proceed?",
-        ):
+        if QMessageBox.question(
+            self, "Confirm",
+            f"Mode: {mode}\n\n{note}Processing {n} file(s).\nProceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
             return
 
-        self._exec_btn.configure(state="disabled", text="  Working…  ")
-        self.root.update()
+        self._sidebar.enable_execute(False)
 
         unsorted_dir = self.classes_dir / "Unsorted"
-        report_rows  = []
+        report_rows: list = []
+        stats = defaultdict(int)
 
         for data in self.files_data:
             filepath  = data["filepath"]
-            dest_name = data["current_dest"]   # user's final choice
-            iid       = str(data["index"])
+            dest_name = data["current_dest"]
+            rel_path  = data["rel_path"]
 
-            # Resolve the physical destination directory
-            if dest_name == "Unsorted":
-                dest_dir = unsorted_dir
-            else:
-                dest_dir = self.classes_dir / dest_name
+            # Preserve subfolder structure in destination
+            sub = rel_path.parent if len(rel_path.parts) > 1 else Path(".")
+            dest_dir = (
+                unsorted_dir / sub if dest_name == "Unsorted"
+                else self.classes_dir / dest_name / sub
+            )
 
-            # Build a safe (non-overwriting) destination path
             raw_path  = dest_dir / filepath.name
             safe_path = unique_dest(raw_path)
 
             if DRY_RUN:
-                action_taken = "SIMULATED"
-                final_path   = str(safe_path)
+                action, final = "SIMULATED", str(safe_path)
             else:
-                dest_dir.mkdir(parents=True, exist_ok=True)
                 try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(filepath), str(safe_path))
-                    action_taken = "MOVED"
-                    final_path   = str(safe_path)
+                    action, final = "MOVED", str(safe_path)
                 except Exception as e:
-                    action_taken = f"ERROR"
-                    final_path   = f"(failed) {e}"
-                    log.error(f"Move failed for {filepath.name}: {e}")
+                    action, final = "ERROR", f"(failed) {e}"
+                    log.error(f"{filepath.name}: {e}")
 
-            # Update data record
-            data["final_dest"]  = dest_name
-            data["final_path"]  = final_path
-            data["action"]      = action_taken.lower()
-            data["executed"]    = True
-
-            # Update treeview row: change status column + colour to DONE
-            done_label = ("✓ Moved"      if action_taken == "MOVED"      else
-                          "~ Simulated"  if action_taken == "SIMULATED"  else
-                          "✗ Error")
-            vals = list(self.tree.item(iid, "values"))
-            vals[3] = done_label
-            self.tree.item(iid, values=vals, tags=("DONE",))
-
+            data.update({"final_dest": dest_name, "final_path": final, "action": action})
+            stats[action] += 1
             report_rows.append({
                 "filename":     data["filename"],
+                "relative_path": data["rel_str"],
                 "original_path": data["original_path"],
                 "final_dest":   dest_name,
-                "final_path":   final_path,
-                "action":       action_taken,
+                "final_path":   final,
+                "action":       action,
                 "confidence":   data["confidence"],
-                "similarity":   data["similarity"],
-                "basis":        data["basis"],
+                "tier":         data["tier"],
+                "ai_folder":    data["ai_folder"],
+                "reasoning":    data["reasoning"],
             })
 
-            # Flush UI every 10 files to stay responsive
-            if data["index"] % 10 == 0:
-                self.root.update()
+        csv_path = self._write_csv(report_rows)
+        self._print_summary(report_rows, stats, csv_path)
 
-        # Generate + save reports (always)
-        report_text = generate_reports(report_rows, self.classes_dir, DRY_RUN)
-
-        self._exec_btn.configure(state="normal", text="  ✓ Done  ")
-        self._show_results_window(report_text)
-
-    # ════════════════════════════════════════════════════════════
-    #  RESULTS WINDOW — always shown, even in dry-run mode
-    # ════════════════════════════════════════════════════════════
-
-    def _show_results_window(self, report_text: str):
-        win = tk.Toplevel(self.root)
-        win.title("ClassSort AI — Sorting Report")
-        win.geometry("860x580")
-        win.minsize(600, 400)
-        win.configure(bg=C_BG)
-
-        # Header
-        hdr = tk.Frame(win, bg=C_HEADER)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="  Sorting Report",
-                 font=("Helvetica Neue", 13, "bold"),
-                 bg=C_HEADER, fg="white", pady=10).pack(side="left")
-        mode_tag = "  🔵 DRY RUN — no files moved  " if DRY_RUN else "  🟢 LIVE — files moved  "
-        tk.Label(hdr, text=mode_tag,
-                 font=("Helvetica Neue", 10),
-                 bg=C_HEADER, fg="#B0BEC5").pack(side="right", padx=10)
-
-        # Scrollable text area showing the full report
-        txt = scrolledtext.ScrolledText(
-            win, wrap="none",
-            font=("Menlo", 10),
-            bg="#FAFAFA", relief="flat",
-            padx=14, pady=14,
+        QMessageBox.information(
+            self, "Complete",
+            f"{'Simulation' if DRY_RUN else 'Execution'} complete!\n\n"
+            + "\n".join(f"{k}: {v}" for k, v in sorted(stats.items()))
+            + f"\n\nReport:\n{csv_path}",
         )
-        txt.pack(fill="both", expand=True, padx=10, pady=(10, 4))
-        txt.insert("1.0", report_text)
-        txt.configure(state="disabled")
+        self.close()
 
-        # Footer showing where the files were saved
-        footer_txt = (
-            f"📄 {self.classes_dir / REPORT_TXT}\n"
-            f"📊 {self.classes_dir / REPORT_CSV}"
-        )
-        tk.Label(win, text=footer_txt,
-                 font=("Helvetica Neue", 9), bg=C_BG, fg="#78909C",
-                 justify="left").pack(anchor="w", padx=14, pady=(0, 4))
+    # ── Report helpers ─────────────────────────────────────────
+    def _write_csv(self, rows: list) -> Path:
+        path   = self.classes_dir / REPORT_CSV
+        fields = ["filename", "relative_path", "original_path", "final_dest",
+                  "final_path", "action", "confidence", "tier", "ai_folder", "reasoning"]
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                w.writerows(rows)
+            log.info(f"CSV → {path}")
+        except Exception as e:
+            log.warning(f"CSV write failed: {e}")
+        return path
 
-        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+    def _print_summary(self, rows: list, stats: dict, csv_path: Path):
+        ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mode = "DRY RUN" if DRY_RUN else "LIVE"
+        sep  = "═" * 72
+
+        print(f"\n{sep}")
+        print(f"  CLASSORT AI v5 — REPORT  [{mode}]  {ts}")
+        print(sep)
+        print(f"  Model  : {OLLAMA_MODEL}  (batch={BATCH_SIZE}, "
+              f"extract_chars={MAX_EXTRACT_CHARS}, workers={EXTRACTION_WORKERS})")
+        print(f"  Source : {self.source_dir}")
+        print(f"  Total  : {len(rows)}")
+        for k, v in sorted(stats.items()):
+            print(f"  {k:<14}: {v}")
+        print(f"\n  CSV : {csv_path}")
+        print(sep)
+        print(f"  {'FILE':<42} {'DEST':<16} {'CONF':>4}  ACTION")
+        print("  " + "─" * 68)
+        for r in rows:
+            fn   = r["filename"][:41]
+            dest = r["final_dest"][:15]
+            print(f"  {fn:<42} {dest:<16} {r['confidence']:>3}%  {r['action']}")
+        print(sep + "\n")
 
 
-# ════════════════════════════════════════════════════════════════
-#  SECTION 9 — ENTRY POINT
-# ════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+#  §15  ENTRY POINT
+# ════════════════════════════════════════════════════════════════════
+
+def main():
+    # Dependency check
+    for pkg in ["PyQt6", "requests"]:
+        try:
+            __import__(pkg)
+        except ImportError:
+            print(f"\n[ERROR] Missing: {pkg}  →  pip install {pkg}")
+            sys.exit(1)
+
+    # Warn if Ollama isn't reachable (non-fatal — scan will still run)
+    try:
+        requests.get("http://localhost:11434", timeout=3)
+    except Exception:
+        print("\n⚠  Ollama not reachable at localhost:11434")
+        print("   Start with:  ollama serve")
+        print("   Files will receive confidence=0 / Unsorted without it.\n")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("ClassSort AI")
+    app.setStyleSheet(QSS)
+
+    window = ClassSortWindow()
+    window.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    if not HAS_SBERT:
-        print("\n[ERROR] sentence-transformers is not installed.")
-        print("Run:  pip install sentence-transformers keybert")
-        print("      pip install PyPDF2 python-docx python-pptx openpyxl\n")
-        sys.exit(1)
-
-    ClassSortApp()
+    main()
